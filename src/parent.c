@@ -4,11 +4,16 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <locale.h>
 
-extern char **environ; // Объявление переменной environ
+extern char **environ;
 
 #define MAX_ENV_VARS 100
 #define CHILD_NAME_FORMAT "child_%02d"
+
+int env_comparator(const void *a, const void *b) {
+    return strcmp(*(const char **)a, *(const char **)b);
+}
 
 void print_sorted_env() {
     char *env_vars[MAX_ENV_VARS];
@@ -18,10 +23,10 @@ void print_sorted_env() {
         env_vars[count++] = *env;
     }
 
-    qsort(env_vars, count, sizeof(char*), (int (*)(const void*, const void*))strcmp);
+    qsort(env_vars, count, sizeof(char *), env_comparator);
 
     for (int i = 0; i < count; i++) {
-        printf("%s\n", env_vars[i]);
+        puts(env_vars[i]);
     }
 }
 
@@ -36,59 +41,103 @@ char **create_child_env() {
     int count = 0;
     char line[256];
 
-    while (fgets(line, sizeof(line), env_file)) {
-        line[strcspn(line, "\n")] = 0; // Удаляем символ новой строки
+    while (fgets(line, sizeof(line), env_file) != NULL && count < MAX_ENV_VARS) {
+        line[strcspn(line, "\n")] = '\0';
         char *value = getenv(line);
-        if (value) {
-            char *env_entry = malloc(strlen(line) + strlen(value) + 2); // +2 для '=' и '\0'
-            sprintf(env_entry, "%s=%s", line, value);
-            env_vars[count++] = env_entry;
+        if (!value) {
+            fprintf(stderr, "Warning: Variable '%s' not found\n", line);
+            continue;
         }
+        env_vars[count] = malloc(strlen(line) + strlen(value) + 2);
+        if (!env_vars[count]) {
+            perror("malloc");
+            exit(EXIT_FAILURE);
+        }
+        sprintf(env_vars[count++], "%s=%s", line, value);
     }
 
-    env_vars[count] = NULL; // Завершаем массив NULL
+    env_vars[count] = NULL;
     fclose(env_file);
 
-    // Копируем массив в динамически выделенную память
     char **result = malloc((count + 1) * sizeof(char *));
-    for (int i = 0; i <= count; i++) {
-        result[i] = env_vars[i];
+    if (!result) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
     }
-
+    memcpy(result, env_vars, (count + 1) * sizeof(char *));
     return result;
 }
 
-void launch_child(char **env, int use_env_file) {
+void launch_child(char **env, const char *mode_name) {
     static int child_count = 0;
     char child_name[16];
     sprintf(child_name, CHILD_NAME_FORMAT, child_count++);
 
     pid_t pid = fork();
     if (pid == 0) {
-        char *argv[] = {child_name, use_env_file ? "env" : NULL, NULL};
-        execve(getenv("CHILD_PATH"), argv, use_env_file ? env : environ);
+        char *argv[] = {child_name, NULL};
+        char *child_path = NULL;
+        
+        if (*mode_name == '+') {
+            child_path = getenv("CHILD_PATH");
+            printf("Using getenv() to find CHILD_PATH\n");
+        } else if (*mode_name == '*') {
+            // Ищем CHILD_PATH в переданном окружении envp
+            extern char **environ;
+            for (int i = 0; environ[i] != NULL; i++) {
+                if (strncmp(environ[i], "CHILD_PATH=", 11) == 0) {
+                    child_path = environ[i] + 11;
+                    printf("Found CHILD_PATH in envp: %s\n", child_path);
+                    break;
+                }
+            }
+        } else if (*mode_name == '&') {
+            // Ищем CHILD_PATH в глобальном environ
+            for (int i = 0; environ[i] != NULL; i++) {
+                if (strncmp(environ[i], "CHILD_PATH=", 11) == 0) {
+                    child_path = environ[i] + 11;
+                    printf("Found CHILD_PATH in environ: %s\n", child_path);
+                    break;
+                }
+            }
+        }
+
+        if (!child_path) {
+            fprintf(stderr, "Error: CHILD_PATH not found\n");
+            exit(EXIT_FAILURE);
+        }
+
+        if (access(child_path, X_OK) == -1) {
+            perror("access");
+            exit(EXIT_FAILURE);
+        }
+
+        execve(child_path, argv, env);
         perror("execve");
         exit(EXIT_FAILURE);
-    } else if (pid > 0) {
-        wait(NULL);
-    } else {
+    } else if (pid < 0) {
         perror("fork");
+    } else {
+        wait(NULL);
     }
 }
 
-int main() {
+int main(int argc, char *argv[], char *envp[]) {
+    setlocale(LC_ALL, "C");
     print_sorted_env();
     char **child_env = create_child_env();
 
     char input;
-    while (1) {
-        scanf(" %c", &input);
-        if (input == '+') {
-            launch_child(child_env, 1);
-        } else if (input == '*') {
-            launch_child(child_env, 0);
-        } else if (input == 'q') {
-            break;
+    while (scanf(" %c", &input) == 1 && input != 'q') {
+        switch (input) {
+            case '+': 
+            case '*': 
+            case '&':
+                launch_child(child_env, &input);
+                break;
+            default:
+                printf("Unknown command\n");
+                break;
         }
     }
 
@@ -96,6 +145,5 @@ int main() {
         free(*env);
     }
     free(child_env);
-
     return 0;
 }
